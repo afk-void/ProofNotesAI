@@ -9,12 +9,53 @@ import subprocess
 import fitz
 from docx import Document
 from pptx import Presentation
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
+import zipfile
+
+from .core import readable_text
 
 SUPPORTED = {'.pdf', '.docx', '.pptx', '.txt', '.md', '.png', '.jpg', '.jpeg', '.webp'}
 MAX_FILE_BYTES = 18 * 1024 * 1024
 MAX_PAGES = 100
 MAX_OCR_PAGES = 18
+MAX_IMAGE_PIXELS = 20_000_000
+
+
+def validate_upload(data: bytes, name: str) -> str:
+    """Cheap checks before handing a bounded upload to a document parser."""
+    ext = Path(name).suffix.lower()
+    if ext not in SUPPORTED or len(name) > 180 or any(ord(c) < 32 for c in name):
+        raise ValueError('Unsupported or invalid filename. Use PDF, DOCX, PPTX, TXT, MD or an image.')
+    if not data or len(data) > MAX_FILE_BYTES:
+        raise ValueError('File is empty or exceeds 18 MB.')
+    if ext == '.pdf':
+        if not data[:1024].lstrip(b'\xef\xbb\xbf\x00\t\r\n ').startswith(b'%PDF-'):
+            raise ValueError('This file is not a valid PDF.')
+    elif ext in {'.png', '.jpg', '.jpeg', '.webp'}:
+        try:
+            with Image.open(BytesIO(data)) as im:
+                expected = {'png':'PNG','jpg':'JPEG','jpeg':'JPEG','webp':'WEBP'}[ext[1:]]
+                if im.format != expected or im.width * im.height > MAX_IMAGE_PIXELS:
+                    raise ValueError('Invalid image format or over 20 megapixels.')
+                im.verify()
+        except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+            raise ValueError('Invalid or unsafe image.') from exc
+    elif ext in {'.pptx', '.docx'}:
+        try:
+            with zipfile.ZipFile(BytesIO(data)) as z:
+                info = z.infolist()
+                if len(info) > 5000 or sum(x.file_size for x in info) > 90_000_000:
+                    raise ValueError('Office document exceeds safe extraction limits.')
+                if any(x.file_size > 30_000_000 for x in info):
+                    raise ValueError('Office document has an oversized component.')
+                prefix = 'word/' if ext == '.docx' else 'ppt/'
+                if not '[Content_Types].xml' in z.namelist() or not any(n.startswith(prefix) for n in z.namelist()):
+                    raise ValueError('Invalid Office document structure.')
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise ValueError('Invalid Office document.') from exc
+    elif b'\x00' in data[:65536]:
+        raise ValueError('Text file contains binary data.')
+    return ext
 
 
 @dataclass
@@ -54,6 +95,8 @@ def extract_pages(path: Path) -> list[Page]:
                 raise ValueError(f'Too many PDF pages (max {MAX_PAGES}).')
             ocr_count = 0
             for i, page in enumerate(pdf):
+                if page.rect.width > 4000 or page.rect.height > 4000 or page.rect.width * page.rect.height > 5_000_000:
+                    raise ValueError('PDF page dimensions are too large to process safely.')
                 text = page.get_text('text', sort=True).strip()
                 used_ocr = False
                 if len(text) < 35:
@@ -89,9 +132,24 @@ def extract_pages(path: Path) -> list[Page]:
         content = path.read_text(encoding='utf-8-sig', errors='replace').strip()
         pages = [Page(i // 6500+1, content[i:i+6500]) for i in range(0, len(content), 6500)]
     elif suffix in {'.png', '.jpg', '.jpeg', '.webp'}:
-        pages.append(Page(1, _ocr_image(path.read_bytes()), True))
+        raw = path.read_bytes()
+        text = ''
+        try:
+            text = _ocr_image(raw)
+        except ValueError:
+            pass
+        try:
+            from .local_models import describe_image
+            visual = describe_image(raw)
+            text = (text + '\n\n' + visual).strip()
+        except (ValueError, OSError, TimeoutError):
+            if not text:
+                raise ValueError('Cannot read this image. Install Tesseract or start local Qwen3.6 27B vision.')
+        pages.append(Page(1, text, bool(text)))
     else:
         raise ValueError('Unsupported file format.')
     if not any(x.text.strip() for x in pages):
         raise ValueError('No readable text. Try a clear searchable file.')
+    for page in pages:
+        page.text = readable_text(page.text)
     return pages

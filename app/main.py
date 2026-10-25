@@ -6,12 +6,12 @@ from pathlib import Path
 import re
 import shutil
 import uuid
-import zipfile
 
 import fitz
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response
+from starlette.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -20,7 +20,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / '.env')
 from . import db  # noqa: E402
 from .ai import answer, embeddings, recall_cards, inspect_claim, _rows_checked  # noqa: E402
 from .core import chunks_from_page, cosine  # noqa: E402
-from .ingest import MAX_FILE_BYTES, SUPPORTED, extract_pages  # noqa: E402
+from .ingest import MAX_FILE_BYTES, extract_pages, validate_upload  # noqa: E402
 from .local_models import MODEL_DEFAULT, ALLOWED_MODELS, EMBEDDING_MODEL, installed_models  # noqa: E402
 
 BASE = Path(__file__).parent
@@ -33,7 +33,7 @@ db.setup()
 async def restrict_cross_origin(request: Request, call_next):
     # Browsers cannot post data from a random website to the local API.
     origin = request.headers.get('origin') or ''
-    if origin and origin not in (f'http://{request.headers.get("host", "")}',):
+    if (origin and origin not in (f'http://{request.headers.get("host", "")}',)) or (request.method not in ('GET','HEAD','OPTIONS') and request.headers.get('sec-fetch-site','same-origin') not in ('same-origin','none')):
         return Response('Cross-origin request blocked', status_code=403)
     return await call_next(request)
 
@@ -123,71 +123,102 @@ def documents():
 @app.get('/api/overview')
 def overview():
     docs = db.docs()
-    rows = db.rows_all()
     return {'documents': len(docs), 'pages': sum(x['page_count'] for x in docs),
-            'evidence_passages': len(rows), 'notes': sum(x['kind'] == 'notes' for x in docs),
+            'evidence_passages': db.chunk_count(), 'notes': sum(x['kind'] == 'notes' for x in docs),
             'slides': sum(x['kind'] == 'slides' for x in docs)}
 
 
 @app.post('/api/upload')
 async def upload(file: UploadFile = File(...), kind: str = Form('notes'), course_id: str = Form('')):
+    return await _ingest_upload(file, kind, course_id)
+
+
+async def _ingest_upload(file: UploadFile, kind: str, course_id: str = '', chat_id: str | None = None):
     if kind not in ('notes', 'slides'):
         raise HTTPException(400, 'Choose My Notes or Lecture Slides.')
     try:
         db.validate_course(course_id or None)
     except ValueError as exc:
         raise HTTPException(422,str(exc)) from exc
-    name = Path(file.filename or 'upload').name
-    ext = Path(name).suffix.lower()
-    if ext not in SUPPORTED:
-        raise HTTPException(400, 'Allowed: PDF, DOCX, PPTX, TXT, MD, PNG, JPG, WEBP.')
+    name = Path((file.filename or 'upload').replace('\\', '/')).name
     data = await file.read(MAX_FILE_BYTES + 1)
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(413, 'File exceeds 18 MB limit.')
     if not data:
         raise HTTPException(400, 'Empty file.')
-    if ext in ('.docx', '.pptx'):
-        try:
-            with zipfile.ZipFile(__import__('io').BytesIO(data)) as arch:
-                if len(arch.infolist()) > 5000 or sum(x.file_size for x in arch.infolist()) > 90_000_000:
-                    raise HTTPException(413, 'Document exceeds safe extracted-size limits.')
-        except zipfile.BadZipFile as exc:
-            raise HTTPException(422, 'Invalid office document.') from exc
+    try:
+        ext = validate_upload(data, name)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    # PDF/OCR/vision/embeddings may take seconds; don't block the web server loop.
+    return await run_in_threadpool(_index_bytes, data, name, ext, kind, course_id, chat_id)
+
+
+def _index_bytes(data: bytes, name: str, ext: str, kind: str, course_id: str, chat_id: str | None):
     digest = hashlib.sha256(data).hexdigest()
+    # Same bytes can have a distinct source identity/name without paying for
+    # another Ollama embedding run. Never move an existing document between chats.
     with db.connect() as con:
-        duplicate = con.execute('SELECT id FROM documents WHERE sha256=? AND kind=? AND embedding_model=?',
-                                (digest, kind, EMBEDDING_MODEL)).fetchone()
-    if duplicate:
-        if course_id:
-            db.assign_course(duplicate['id'],course_id)
-        return {'ok': True, 'duplicate': True, 'id': duplicate['id']}
+        prior = con.execute('SELECT id,page_count,chunk_count,ocr_count FROM documents '
+                            'WHERE sha256=? AND embedding_model=? ORDER BY created_at,id LIMIT 1',
+                            (digest, EMBEDDING_MODEL)).fetchone()
     uid = uuid.uuid4().hex
     path = db.UPLOADS / f'{uid}{ext}'
-    path.write_bytes(data)
+    with path.open('xb') as out:
+        os.chmod(path, 0o600)
+        out.write(data)
     try:
-        pages = extract_pages(path)
-        units = [(page, chunk) for page in pages for chunk in chunks_from_page(page.text)]
-        if not units or len(units) > 850:
-            raise ValueError('No searchable content or more than 850 passages. Split this file.')
-        vecs = embeddings([chunk for page, chunk in units])
+        if prior:
+            # Reuse validated, already indexed text and vectors; not model inference.
+            pages = None
+            units = None
+            vecs = None
+        else:
+            pages = extract_pages(path)
+            units = [(page, chunk) for page in pages for chunk in chunks_from_page(page.text)]
+            if not units or len(units) > 850:
+                raise ValueError('No searchable content or more than 850 passages. Split this file.')
+            vecs = embeddings([chunk for page, chunk in units])
         with db.connect() as con:
+            # A write lock makes name assignment safe under concurrent uploads.
+            con.execute('BEGIN IMMEDIATE')
+            names = {r['name'].lower() for r in con.execute('SELECT name FROM documents')}
+            display_name = db.unique_document_name(name, names) if name.lower() in names else name
+            if prior:
+                old_pages = con.execute('SELECT number,text,ocr FROM pages WHERE doc_id=? ORDER BY number',(prior['id'],)).fetchall()
+                old_chunks = con.execute('SELECT page_number,text,vector FROM chunks WHERE doc_id=? ORDER BY id',(prior['id'],)).fetchall()
+                if not old_pages or not old_chunks:
+                    raise ValueError('Existing duplicate has no indexed content; delete it and reupload.')
+                stats = (prior['page_count'], len(old_chunks), prior['ocr_count'])
+            else:
+                stats = (len(pages), len(units), sum(p.ocr for p in pages))
             con.execute('INSERT INTO documents (id,name,kind,ext,path,sha256,page_count,chunk_count,ocr_count,embedding_model,course_id) '
                         'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-                        (uid, name, kind, ext, str(path), digest, len(pages), len(units),
-                         sum(p.ocr for p in pages), EMBEDDING_MODEL,course_id or None))
-            for p in pages:
-                con.execute('INSERT INTO pages (doc_id,number,text,ocr) VALUES (?,?,?,?)',
-                            (uid, p.number, p.text, int(p.ocr)))
-            for (page, chunk), vec in zip(units, vecs):
-                cur = con.execute('INSERT INTO chunks (doc_id,page_number,text,vector) VALUES (?,?,?,?)',
-                                  (uid, page.number, chunk, json.dumps(vec)))
-                con.execute('INSERT INTO chunk_search (rowid,text,chunk_id) VALUES (?,?,?)',
-                            (cur.lastrowid, chunk, cur.lastrowid))
+                        (uid, display_name, kind, ext, str(path), digest, *stats, EMBEDDING_MODEL,course_id or None))
+            if prior:
+                for p in old_pages:
+                    con.execute('INSERT INTO pages (doc_id,number,text,ocr) VALUES (?,?,?,?)',(uid,p['number'],p['text'],p['ocr']))
+                for old in old_chunks:
+                    cur=con.execute('INSERT INTO chunks (doc_id,page_number,text,vector) VALUES (?,?,?,?)',
+                                    (uid,old['page_number'],old['text'],old['vector']))
+                    con.execute('INSERT INTO chunk_search (rowid,text,chunk_id) VALUES (?,?,?)',
+                                (cur.lastrowid,old['text'],cur.lastrowid))
+            else:
+                for p in pages:
+                    con.execute('INSERT INTO pages (doc_id,number,text,ocr) VALUES (?,?,?,?)',
+                                (uid, p.number, p.text, int(p.ocr)))
+                for (page, chunk), vec in zip(units, vecs):
+                    cur = con.execute('INSERT INTO chunks (doc_id,page_number,text,vector) VALUES (?,?,?,?)',
+                                      (uid, page.number, chunk, json.dumps(vec)))
+                    con.execute('INSERT INTO chunk_search (rowid,text,chunk_id) VALUES (?,?,?)',
+                                (cur.lastrowid, chunk, cur.lastrowid))
+            if chat_id:
+                con.execute('INSERT OR IGNORE INTO chat_documents(chat_id,doc_id) VALUES (?,?)', (chat_id, uid))
     except Exception as exc:
         path.unlink(missing_ok=True)
         _error(exc, 'Indexing')
-    return {'ok': True, 'duplicate': False, 'id': uid, 'pages': len(pages),
-            'chunks': len(units), 'ocr_pages': sum(p.ocr for p in pages)}
+    return {'ok': True, 'duplicate': bool(prior), 'id': uid, 'name': display_name,
+            'pages': stats[0], 'chunks': stats[1], 'ocr_pages': stats[2]}
 
 
 @app.delete('/api/documents/{doc_id}')
@@ -253,16 +284,24 @@ def pdf_preview(doc_id: str, page: int, quote: str = ''):
 def _inventory_answer(question, allowed_docs, label='your library'):
     # File metadata is a database query, not an LLM question.
     if not re.search(r'\b(?:what|which|list|show|how many|tell me)\b', question, re.I) or not re.search(
-            r'\b(?:files?|slides?|documents?|pdfs?|notes?|uploads?)\b', question, re.I) or not re.search(
+            r'\b(?:files?|slides?|lectures?|documents?|pdfs?|notes?|uploads?)\b', question, re.I) or not re.search(
             r'\b(?:upload(?:ed)?|have|available|library|list|show|added)\b', question, re.I):
         return None
-    kind = 'slides' if re.search(r'\bslides?\b', question, re.I) else 'notes' if re.search(r'\bnotes?\b', question, re.I) and not re.search(r'\bfiles?|documents?|pdfs?\b', question, re.I) else None
-    allowed_docs = [d for d in allowed_docs if d['kind']==kind] if kind else allowed_docs
+    wants_slides = bool(re.search(r'\b(?:slides?|lectures?)\b', question, re.I))
+    kind = 'slides' if wants_slides else 'notes' if re.search(r'\bnotes?\b', question, re.I) and not re.search(r'\bfiles?|documents?|pdfs?\b', question, re.I) else None
+    # A PDF named Lecture1.2.pdf may have been uploaded with the default 'notes' kind.
+    # Its filename still identifies it as lecture material. Exclude syllabi.
+    if wants_slides:
+        allowed_docs = [d for d in allowed_docs if
+                        (d['kind'] == 'slides' or re.search(r'\b(?:lecture|slides?|chapter)[\s._-]*\d', d['name'], re.I))
+                        and not re.search(r'\b(?:syllabus|policy|schedule)\b', d['name'], re.I)]
+    elif kind == 'notes':
+        allowed_docs = [d for d in allowed_docs if d['kind'] == 'notes']
     if not allowed_docs:
         message = f'No {kind or "documents"} are assigned to {label} yet.'
     else:
         lines = [f'**{len(allowed_docs)} uploaded file(s) in {label}:**']
-        lines.extend(f'- {d["name"]} — {"slides" if d["kind"] == "slides" else "notes"}, {d["page_count"]} pages'
+        lines.extend(f'- {d["name"]} — {"slides" if wants_slides or d["kind"] == "slides" else "notes"}, {d["page_count"]} page{"s" if d["page_count"] != 1 else ""}'
                      for d in allowed_docs)
         message = '\n'.join(lines)
     return {'status':'conversation','answer_mode':'library',
@@ -392,6 +431,15 @@ def create_chat(payload: CreateChatRequest):
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.post('/api/chats/{chat_id}/upload')
+async def chat_upload(chat_id: str, file: UploadFile = File(...)):
+    chat = _chat_or_404(chat_id)
+    # Uploads inherit the course. Individual chat uploads are also linked to the chat.
+    name = Path((file.filename or '').replace('\\','/')).name
+    kind = 'slides' if name.lower().endswith('.pptx') or re.search(r'(?:lecture|slides?|chapter)[._ -]*[0-9]', name, re.I) else 'notes'
+    return await _ingest_upload(file, kind, chat['course_id'] or '', chat_id)
+
+
 @app.get('/api/chats/{chat_id}')
 def chat_detail(chat_id: str):
     return {'chat': _chat_or_404(chat_id)}
@@ -426,7 +474,9 @@ def chat_ask(chat_id: str, payload: ChatAskRequest):
         raise HTTPException(422, 'A source in this chat was deleted. Re-select sources for this conversation.') from exc
     history = [{'role': m['role'], 'content': m['content'][:450]} for m in chat['messages'][-8:]]
     try:
-        source_ids = db.course_doc_ids(chat['course_id']) if chat['course_id'] else chat['doc_ids'] or None
+        attachments = db.chat_attachment_ids(chat_id)
+        scope = db.course_doc_ids(chat['course_id']) if chat['course_id'] else chat['doc_ids'] or None
+        source_ids = list(dict.fromkeys((scope or []) + attachments)) if scope is not None else None
         selected = [d for d in db.docs() if source_ids is None or d['id'] in source_ids]
         course_name = next((c['name'] for c in db.courses() if c['id']==chat['course_id']), 'your course')
         result = _inventory_answer(payload.question, selected, course_name if chat['course_id'] else 'your selected sources')

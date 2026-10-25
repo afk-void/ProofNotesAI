@@ -9,7 +9,7 @@ from typing import Literal
 from . import db
 from .core import cosine, find_quote, fts_query, fuse_rankings
 from .local_models import ALLOWED_MODELS, MODEL_DEFAULT, EMBEDDING_MODEL, structured, vectors, plain_chat
-from .evidence_extraction import definition_answer, lecture_overview
+from .evidence_extraction import definition_answer, lecture_overview, explained_from_examples
 from .conversation import chat_reply, conversation_response, resolve_question, is_anaphoric, is_expansion, last_topic
 from .topic_overview import source_overview
 from .syllabus import syllabus_answer
@@ -47,8 +47,8 @@ def embeddings(texts):
     return vectors(texts)
 
 
-def _rows_checked():
-    rows = db.rows_all()
+def _rows_checked(rows=None):
+    rows = db.rows_all() if rows is None else rows
     mismatched = [r for r in rows if r['embedding_model'] != EMBEDDING_MODEL]
     if mismatched:
         raise ValueError('The library was indexed with a different embedding model. Switch EMBEDDING_MODEL back or reindex documents.')
@@ -75,65 +75,50 @@ def _terms(text):
     return list(dict.fromkeys(expanded))[:12]
 
 
-def retrieve(question: str, history: list[dict] | None = None, limit=12, doc_ids: list[str] | None = None):
+def retrieve(question: str, history: list[dict] | None = None, limit=12, doc_ids: list[str] | None = None, rows=None):
+    """FTS5/BM25 shortlist, then local embedding similarity + lexical relevance."""
     history = history or []
     prior_questions = [m.get('content', '') for m in history if m.get('role') == 'user']
     search_text = question
-    # Preserve question-specific keywords; history is only a hint for followups.
     if len(_terms(question)) <= 1 and prior_questions and not re.search(r'\b(lecture|chapter)\s*\d', question, re.I):
         search_text = question + ' ' + prior_questions[-1][:180]
-    rows = _rows_checked()
+    rows = rows if rows is not None else (_rows_checked() if db.chunk_count() <= 350 else _rows_checked(db.indexed_rows(search_text, doc_ids)))
     if doc_ids is not None:
         selected_ids = set(doc_ids)
         rows = [r for r in rows if r['doc_id'] in selected_ids]
     if not rows:
         return []
     vec = embeddings([search_text])[0]
-    scored_vec = sorted(rows, key=lambda r: cosine(json.loads(r['vector']), vec), reverse=True)
-    vec_ids = [r['id'] for r in scored_vec[:min(70, len(rows))]]
+    scored = sorted(rows, key=lambda r: cosine(json.loads(r['vector']), vec), reverse=True)
+    vec_ids = [r['id'] for r in scored[:min(70, len(rows))]]
     terms = _terms(search_text)
-    q = ' OR '.join('"' + t + '"' for t in terms) if terms else fts_query(search_text)
-    lexical_ids = []
-    if q:
-        permitted = {r['id'] for r in rows}
-        with db.connect() as con:
-            lexical_ids = [int(x['chunk_id']) for x in con.execute(
-                'SELECT chunk_id FROM chunk_search WHERE chunk_search MATCH ? ORDER BY bm25(chunk_search) LIMIT 100', (q,))
-                if int(x['chunk_id']) in permitted][:70]
-    fused = fuse_rankings(vec_ids, lexical_ids, limit=min(len(rows), 85))
+    # FTS candidate ordering already gives BM25 rank; combine with local cosine.
+    fused = fuse_rankings(vec_ids, [r['id'] for r in rows], limit=min(len(rows), 100))
     by_id = {r['id']: r for r in rows}
     order = {cid: i for i, cid in enumerate(fused)}
     definition = bool(re.match(r'\s*(?:what\s+(?:is|are)|define)\b', question, re.I))
     overview = bool(re.search(r'\b(lecture|chapter)\s*\d', question, re.I))
     def rating(r):
-        text = r['text'].lower()
+        txt = r['text'].lower()
         title = r['name'].lower()
-        hits = sum(min(2, len(re.findall(r'\b'+re.escape(t)+r'\b', text))) for t in terms)
-        coverage = sum(bool(re.search(r'\b'+re.escape(t)+r'\b', text)) for t in terms)
-        score = 4.0 * hits + 4.0 * coverage + 3.0 * sum(t in title for t in terms)
-        if definition and any(re.search(r'\b(?:a|an|the)\s+'+re.escape(t)+r'\s+(?:is|are|means|refers)', text)
-                              for t in terms):
+        hits = sum(min(2, len(re.findall(r'\b'+re.escape(x)+r'\b', txt))) for x in terms)
+        coverage = sum(bool(re.search(r'\b'+re.escape(x)+r'\b', txt)) for x in terms)
+        score = 4.0 * hits + 4.0 * coverage + 3.0 * sum(x in title for x in terms)
+        if definition and any(re.search(r'\b(?:a|an|the)\s+'+re.escape(x)+r'\s+(?:is|are|means|refers)', txt) for x in terms):
             score += 40.0
         if overview and re.search(r'lecture[._ -]*\d', title):
             score += 15.0
-        # Discourage pages with only a heading from outranking explanatory text.
-        if len(text.split()) < 9:
+        if len(txt.split()) < 9:
             score -= 10.0
-        return (score, -order.get(r['id'], 1000))
-    # Lexical matches from anywhere in the file can rescue a definition that
-    # vector-only top-K would otherwise miss.
-    candidates = {cid: by_id[cid] for cid in fused if cid in by_id}
-    for r in rows:
-        if terms and any(re.search(r'\b'+re.escape(t)+r'\b', r['text'].lower()) for t in terms):
-            candidates[r['id']] = r
-    ranked = sorted(candidates.values(), key=rating, reverse=True)
+        return score, -order.get(r['id'], 1000)
+    ranked = sorted((by_id[cid] for cid in fused if cid in by_id), key=rating, reverse=True)
     selected, page_count = [], {}
     for hit in ranked:
-        page_key = (hit['doc_id'], hit['page_number'])
-        if page_count.get(page_key, 0) >= 2:
+        key = hit['doc_id'], hit['page_number']
+        if page_count.get(key, 0) >= 2:
             continue
         selected.append(hit)
-        page_count[page_key] = page_count.get(page_key, 0) + 1
+        page_count[key] = page_count.get(key, 0) + 1
         if len(selected) >= limit:
             break
     return selected
@@ -303,14 +288,17 @@ def answer(question: str, history: list[dict], model: str, doc_ids: list[str] | 
         return conversation_response(small_talk)
     if response_mode == 'general':
         return _general_answer(question, history, model)
-    rows = _rows_checked()
+    resolved_query, _ = resolve_question(question, history)
+    # Syllabus queries use a page-level SQL index, never a whole-library vector scan.
+    if re.search(r'\b(?:syllab(?:us|i)|mid[ -]?term|exams?|final|grading)\b|\.pdf\b', question, re.I):
+        syllabus = syllabus_answer(question, db.syllabus_rows(doc_ids), history=history)
+        if syllabus is not None:
+            return syllabus
+    whole_doc = bool(_study_request(question) or re.search(r'\b(?:lecture overview|summari[sz]e (?:the )?(?:whole|entire))\b', question, re.I))
+    rows = _rows_checked() if whole_doc or db.chunk_count() <= 350 else _rows_checked(db.indexed_rows(resolved_query, doc_ids, limit=320))
     if doc_ids is not None:
-        rows = [r for r in rows if r['doc_id'] in set(doc_ids)]
-    # Whole-document syllabus questions need ALL pages, not a 12-chunk search.
-    # This path uses literal local PDF text; it never guesses exam dates.
-    syllabus = syllabus_answer(question, rows)
-    if syllabus is not None:
-        return syllabus
+        selected_ids = set(doc_ids)
+        rows = [r for r in rows if r['doc_id'] in selected_ids]
     # Explicit course/PDF requests never silently fall back to generic advice.
     forced_notes = (response_mode == 'notes' or _explicit_source_request(question) or
                     (bool(rows) and is_anaphoric(question) and (bool(last_topic(history)) or
@@ -346,10 +334,10 @@ def answer(question: str, history: list[dict], model: str, doc_ids: list[str] | 
         expanded = source_overview(topic, rows, doc_ids)
         if expanded:
             return expanded
-    hits = retrieve(resolved, history, doc_ids=doc_ids)
+    hits = retrieve(resolved, history, doc_ids=doc_ids, rows=rows)
     if not hits:
         return insufficient('I couldn’t find relevant passages in the selected sources. Try another term or choose more notes.')
-    extractive = definition_answer(resolved, hits)
+    extractive = definition_answer(resolved, hits) or explained_from_examples(resolved, hits)
     if extractive:
         return extractive
     ref = {f'S{i}': hit for i, hit in enumerate(hits, 1)}

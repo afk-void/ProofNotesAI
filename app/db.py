@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import sqlite3
 
+from .core import readable_text
+
 DATA = Path(os.getenv('PROOFNOTES_DATA_DIR', str(Path(__file__).parent / 'data')))
 DATA.mkdir(parents=True, exist_ok=True)
 UPLOADS = DATA / 'uploads'
@@ -44,10 +46,63 @@ def setup():
     setup_chats()
     with connect() as con:
         con.execute('CREATE TABLE IF NOT EXISTS courses (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE)')
+        con.executescript('''
+          CREATE TABLE IF NOT EXISTS chat_documents (
+            chat_id TEXT NOT NULL, doc_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(chat_id, doc_id),
+            FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE,
+            FOREIGN KEY(doc_id) REFERENCES documents(id) ON DELETE CASCADE
+          );
+        ''')
         for table in ('documents', 'chats'):
             columns = {r['name'] for r in con.execute(f'PRAGMA table_info({table})')}
             if 'course_id' not in columns:
                 con.execute(f'ALTER TABLE {table} ADD COLUMN course_id TEXT')
+        con.execute('CREATE INDEX IF NOT EXISTS documents_course_idx ON documents(course_id)')
+        # Older uploads may have the same display name; repair them once on startup.
+        # Keep every document ID, source citation and attached chat intact.
+        existing = con.execute('SELECT id,name FROM documents ORDER BY created_at,id').fetchall()
+        reserved = {row['name'].lower() for row in existing}
+        seen = set()
+        for row in existing:
+            if row['name'].lower() in seen:
+                name = unique_document_name(row['name'], reserved)
+                con.execute('UPDATE documents SET name=? WHERE id=?', (name,row['id']))
+                reserved.add(name.lower())
+                seen.add(name.lower())
+            else:
+                seen.add(row['name'].lower())
+        con.execute('CREATE UNIQUE INDEX IF NOT EXISTS documents_display_name_idx ON documents(name COLLATE NOCASE)')
+
+
+def unique_document_name(name, taken):
+    """Human-friendly suffixes; IDs/paths stay opaque and unique independently."""
+    from pathlib import Path
+    original = Path(name)
+    # Re-uploading "Lecture (1).pdf" should become "Lecture (2).pdf".
+    stem = __import__('re').sub(r' \(\d+\)$', '', original.stem)
+    for i in range(1, 100000):
+        candidate = f'{stem} ({i}){original.suffix}'
+        if candidate.lower() not in taken:
+            return candidate
+    raise ValueError('Too many files with this name.')
+
+
+def syllabus_rows(doc_ids=None):
+    """Read only syllabus pages (not every embedded chunk/vector in the library)."""
+    selected = list(dict.fromkeys(doc_ids)) if doc_ids is not None else None
+    if selected is not None and not selected:
+        return []
+    scope = (' AND d.id IN (' + ','.join('?' for _ in selected) + ')') if selected is not None else ''
+    with connect() as con:
+        rows = con.execute('''
+            SELECT d.id AS doc_id,d.name,d.sha256,d.kind,d.course_id,
+                   p.number AS page_number,p.text,p.ocr
+            FROM documents d JOIN pages p ON p.doc_id=d.id
+            WHERE (lower(d.name) LIKE '%syllabus%' OR lower(d.name) LIKE '%syllabi%')
+        ''' + scope + ' ORDER BY d.created_at,d.id,p.number', selected or []).fetchall()
+    return [{**dict(x), 'text': readable_text(x['text']), '_full_page': True} for x in rows]
 
 
 def docs():
@@ -58,12 +113,55 @@ def docs():
 def pages_for(doc_id: str, page: int):
     with connect() as con:
         x = con.execute('SELECT number, text, ocr FROM pages WHERE doc_id=? AND number=?', (doc_id, page)).fetchone()
-        return dict(x) if x else None
+        return {**dict(x), "text": readable_text(x["text"])} if x else None
 
 
 def rows_all():
     with connect() as con:
-        return [dict(x) for x in con.execute('SELECT chunks.id,doc_id,page_number,text,vector,documents.name,documents.kind,documents.embedding_model FROM chunks JOIN documents ON documents.id=chunks.doc_id')]
+        return [{**dict(x), 'text': readable_text(x['text'])} for x in con.execute('SELECT chunks.id,doc_id,page_number,text,vector,documents.name,documents.kind,documents.embedding_model FROM chunks JOIN documents ON documents.id=chunks.doc_id')]
+
+
+
+
+def indexed_rows(question: str, doc_ids=None, *, limit=320):
+    'Bounded FTS5 candidates with scope pushed into SQL; no library-wide vector scan.'
+    from .core import fts_query
+    # Reject filler before BM25 so 'what is' cannot swamp specific terms.
+    stop = {'what','which','when','where','why','how','are','was','were','the','this','that','these','those','does','for','and','from','with','tell','please','about','lecture','explain','define','can','you','give','me','is','a','an','of','to','in','on','my','your','slides','notes'}
+    terms = [x for x in __import__('re').findall(r'[a-z0-9]+', question.lower()) if len(x)>1 and x not in stop][:18]
+    # Basic singular/plural rescue, without rescanning the corpus.
+    terms = list(dict.fromkeys(terms + [x[:-1] for x in terms if x.endswith('s') and len(x)>4]))
+    query = fts_query(' '.join(terms)) if terms else ''
+    if not query:
+        return []
+    selected = list(dict.fromkeys(doc_ids)) if doc_ids is not None else None
+    if selected is not None and not selected:
+        return []
+    scope = (' AND c.doc_id IN (' + ','.join('?' for _ in selected) + ')') if selected is not None else ''
+    sql = ('''SELECT c.id,c.doc_id,c.page_number,c.text,c.vector,d.name,d.kind,d.embedding_model
+           FROM chunk_search JOIN chunks c ON c.id=chunk_search.rowid
+           JOIN documents d ON d.id=c.doc_id
+           WHERE chunk_search MATCH ?''' + scope + ''' ORDER BY chunk_search.rank LIMIT ?''')
+    with connect() as con:
+        try:
+            rows = con.execute(sql, [query] + (selected or []) + [limit]).fetchall()
+        except sqlite3.OperationalError:
+            return []
+    return [{**dict(x), 'text': readable_text(x['text'])} for x in rows]
+
+
+def chunk_count():
+    with connect() as con:
+        return con.execute('SELECT count(*) FROM chunks').fetchone()[0]
+
+def chat_attachment_ids(chat_id):
+    with connect() as con:
+        return [r['doc_id'] for r in con.execute('SELECT doc_id FROM chat_documents WHERE chat_id=? ORDER BY created_at,doc_id', (chat_id,))]
+
+
+def attach_to_chat(chat_id, doc_id):
+    with connect() as con:
+        con.execute('INSERT OR IGNORE INTO chat_documents(chat_id,doc_id) VALUES (?,?)', (chat_id,doc_id))
 
 
 def delete_document(doc_id: str) -> bool:
@@ -162,6 +260,9 @@ def get_chat(chat_id: str, include_messages=True):
             return None
         chat = dict(row)
         chat['doc_ids'] = json.loads(chat['doc_ids'])
+        chat['attachments'] = [dict(d) for d in con.execute('''
+            SELECT d.id,d.name,d.kind,d.ext,d.page_count FROM documents d
+            JOIN chat_documents a ON a.doc_id=d.id WHERE a.chat_id=? ORDER BY a.created_at,d.id''', (chat_id,))]
         if include_messages:
             chat['messages'] = [dict(m) | {'response': json.loads(m['response_json']) if m['response_json'] else None}
                                 for m in con.execute('SELECT id,role,content,response_json,created_at FROM chat_messages WHERE chat_id=? ORDER BY id', (chat_id,))]

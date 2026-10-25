@@ -1,14 +1,14 @@
 const $ = s => document.querySelector(s);
 const el = id => document.getElementById(id);
 const state = {docs:[], courses:[], chats:[], chatId:null, scopeCourseId:null, scopeDocIds:[], history:[], busy:false, sourceMap:{}, messageCount:0, scroll:true, responseMode:'auto'};
-const esc = s => String(s ?? '').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+const esc = s => String(s ?? '').replace(/[\uF097\uF0B7\uF0A7\uF0D8\uF09E]/g,'•').replace(/\uF0E0/g,'→').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 let toastTimer;
 function toast(msg){let t=el('toast');t.textContent=msg;t.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('show'),4600)}
 async function api(path,options={}){
  const r=await fetch(path,options);let data;try{data=await r.json()}catch{data={detail:'Unexpected server response.'}}
  if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:`Request failed (${r.status})`);return data;
 }
-function setBusy(b){state.busy=b;el('ask-send').disabled=b;el('question').disabled=b;el('gap-btn').disabled=b;el('recall-btn').disabled=b;el('claim-btn').disabled=b;}
+function setBusy(b){state.busy=b;el('chat-attach').disabled=b;el('ask-send').disabled=b;el('question').disabled=b;el('gap-btn').disabled=b;el('recall-btn').disabled=b;el('claim-btn').disabled=b;}
 function showModal(){el('upload-modal').hidden=false;closeSidebar();el('close-upload').focus()}
 function hideModal(){el('upload-modal').hidden=true}
 function formatKind(kind){return kind==='slides'?'Lecture slides':'My notes'}
@@ -30,7 +30,7 @@ async function uploadFiles(files){hideModal();if(!files.length)return;
  for(const file of files){toast(`Indexing ${file.name}…`);
   const form=new FormData(); form.append('file',file);form.append('kind',kind);form.append('course_id',el('upload-course').value||'');
   try{const d=await api('/api/upload',{method:'POST',body:form});successes++;
-    toast(d.duplicate?`${file.name} is already in your library.`:`Indexed ${file.name}: ${d.pages} pages, ${d.chunks} passages${d.ocr_pages?` (${d.ocr_pages} OCR)` : ''}.`);
+    toast(d.duplicate?`Saved ${d.name} (reused existing index).`:`Indexed ${d.name}: ${d.pages} pages, ${d.chunks} passages${d.ocr_pages?` (${d.ocr_pages} OCR)` : ''}.`);
   }catch(e){toast(`${file.name}: ${e.message}`)}
  }
  if(successes){await loadDocs();await loadChats()}el('file-input').value='';
@@ -95,18 +95,54 @@ async function saveScope(){
   toast(course?`Chat limited to ${courseName(course)}.`:ids.length?'Chat limited to selected files.':'Chat uses the entire library.');
  }catch(e){toast(e.message)}
 }
+function showChatAttachments(files=[]){
+ const bar=el('chat-attachments');
+ bar.innerHTML=files.length?'<span class="attach-label">In this chat</span>'+files.map(f=>`<a href="/api/documents/${encodeURIComponent(f.id)}/file" target="_blank" rel="noopener noreferrer" title="Open ${esc(f.name)}">▤ ${esc(f.name)}</a>`).join(''):'';
+}
+async function ensureChat(){
+ if(state.chatId)return state.chatId;
+ const made=await api('/api/chats',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_ids:state.scopeDocIds,course_id:state.scopeCourseId})});
+ state.chatId=made.chat.id;return state.chatId;
+}
+// Size the field to its actual content, with a viewport-aware ceiling.
+function resizeComposer(){
+ const box=el('question');
+ box.style.height='auto';
+ if(box.offsetParent!==null)box.style.height=Math.min(box.scrollHeight,Math.max(90,Math.min(240,Math.floor(window.innerHeight*.32))))+'px';
+}
+function canDropInChat(){return !el('chat').hidden && !state.busy && el('upload-modal').hidden && el('scope-modal').hidden;}
+function draggedFiles(event){return Array.from(event.dataTransfer?.types||[]).includes('Files');}
+async function uploadChatFiles(files){
+ if(state.busy||!files.length)return;
+ if(files.length>10){toast('Upload up to 10 files at a time.');return;}
+ setBusy(true);el('chat-attach').setAttribute('aria-busy','true');
+ try{
+   const id=await ensureChat();
+   let done=0;
+   for(const file of files){
+     if(file.size>18*1024*1024){toast(`${file.name}: Maximum 18 MB per file.`);continue;}
+     toast(`Reading and indexing ${file.name}…`);
+     const form=new FormData();form.append('file',file);
+     try{const result=await api(`/api/chats/${id}/upload`,{method:'POST',body:form});done++;
+       toast(result.duplicate?`Saved ${result.name} (reused existing index).`:`${result.name} indexed (${result.pages} pages).`);
+     }catch(err){toast(`${file.name}: ${err.message}`)}
+   }
+   if(done){const data=await api(`/api/chats/${id}`);showChatAttachments(data.chat.attachments);await loadDocs();await loadChats();}
+ }catch(e){toast(e.message)}
+ finally{el('chat-file-input').value='';el('chat-attach').removeAttribute('aria-busy');setBusy(false);el('question').focus()}
+}
 async function openChat(id){if(state.busy)return;
  try{const data=await api(`/api/chats/${id}`);const chat=data.chat;state.chatId=chat.id;state.scopeCourseId=chat.course_id||null;state.scopeDocIds=chat.doc_ids;state.sourceMap={};state.messageCount=0;state.history=[];
- el('messages').innerHTML='';el('chat-title').textContent=chat.title;el('source-panel').hidden=true;startChat();
+ el('messages').innerHTML='';el('chat-title').textContent=chat.title;el('source-panel').hidden=true;startChat();showChatAttachments(chat.attachments);
  for(const msg of chat.messages){if(msg.role==='user'){el('messages').insertAdjacentHTML('beforeend',`<div class="message-user"><div class="user-bubble">${esc(msg.content)}</div></div>`);state.history.push({role:'user',content:msg.content});}
   else{const d=msg.response||{status:'insufficient',direct:[{text:msg.content,source_ids:[]}],sources:[]};const mid=sourceRegister(d.sources||[]);el('messages').insertAdjacentHTML('beforeend',answerHtml(d,mid));state.history.push({role:'assistant',content:msg.content});}}
  state.history=state.history.slice(-10);updateScopeUI();await loadChats();jumpBottom();closeSidebar();}
  catch(e){toast(e.message)}
 }
-function newConversation(courseId=null){if(state.busy)return;if(typeof courseId!=='string')courseId=null;state.chatId=null;state.scopeCourseId=courseId;state.scopeDocIds=[];state.history=[];state.sourceMap={};state.messageCount=0;el('chat-title').textContent='New conversation';el('messages').innerHTML=`<div class="chat-welcome"><strong>What would you like to know?</strong><p>${courseId?`Ask about ${esc(courseName(courseId))} or anything else.`:'Choose a course or simply ask a question.'}</p></div>`;el('question').value='';el('source-panel').hidden=true;startChat();updateScopeUI();loadChats();closeSidebar();el('question').focus();}
+function newConversation(courseId=null){if(state.busy)return;if(typeof courseId!=='string')courseId=null;state.chatId=null;state.scopeCourseId=courseId;state.scopeDocIds=[];state.history=[];state.sourceMap={};state.messageCount=0;showChatAttachments();el('chat-title').textContent='New conversation';el('messages').innerHTML=`<div class="chat-welcome"><strong>What would you like to know?</strong><p>${courseId?`Ask about ${esc(courseName(courseId))} or anything else.`:'Choose a course or simply ask a question.'}</p></div>`;el('question').value='';el('source-panel').hidden=true;startChat();resizeComposer();updateScopeUI();loadChats();closeSidebar();el('question').focus();}
 function setActiveNav(name){document.querySelectorAll('[data-nav]').forEach(b=>b.classList.toggle('active',b.dataset.nav===name));el('crumb-current').textContent=({home:'Home',lens:'Chats',radar:'Coverage radar',recall:'Recall lab',claim:'Claim inspector',sources:'Sources'})[name]||'Home';}
 function startChat(){el('composer-wrap').hidden=false;el('landing').hidden=true;el('mode-section').hidden=true;el('chat').hidden=false;setActiveNav('lens');}
-function clearChat(){el('composer-wrap').hidden=true;el('main-scroll').scrollTop=0;setActiveNav('home');state.chatId=null;state.scopeCourseId=null;state.scopeDocIds=[];state.history=[];state.sourceMap={};updateScopeUI();el('messages').innerHTML='';el('chat').hidden=true;el('mode-section').hidden=true;el('landing').hidden=false;el('source-panel').hidden=true;el('question').value='';el('question').focus();closeSidebar()}
+function clearChat(){el('composer-wrap').hidden=true;el('main-scroll').scrollTop=0;setActiveNav('home');state.chatId=null;state.scopeCourseId=null;state.scopeDocIds=[];state.history=[];state.sourceMap={};showChatAttachments();updateScopeUI();el('messages').innerHTML='';el('chat').hidden=true;el('mode-section').hidden=true;el('landing').hidden=false;el('source-panel').hidden=true;el('question').value='';resizeComposer();el('question').focus();closeSidebar()}
 function jumpBottom(){const m=el('main-scroll');m.scrollTo({top:m.scrollHeight,behavior:'smooth'})}
 function inlineMarkup(text){
  // Escape first: notes and model responses are untrusted strings, not HTML.
@@ -172,11 +208,11 @@ function answerHtml(d,messageId){
  return `<article class="assistant-bubble reply"><div class="assistant-name">ProofNotes <span class="reply-mode">${origin}</span></div><div class="answer-direct readable">${direct}</div>${detail}${d.extra?`<section class="practice-extra"><h3>${esc(d.extra_label||'AI-generated examples · not from your notes')}</h3>${renderProse(d.extra)}</section>`:''}${sourceLinks?`<details class="source-disclosure"><summary>View sources · ${uniqueSources.length} page${uniqueSources.length!==1?'s':''}</summary><div class="source-link-list">${sourceLinks}</div></details>`:''}${next}</article>`;
 }
 async function ask(q){q=(q||'').trim();if(!q||state.busy)return;
- startChat();el('question').value='';state.scroll=true;const welcome=el('messages').querySelector('.chat-welcome');if(welcome)welcome.remove();
+ startChat();el('question').value='';resizeComposer();state.scroll=true;const welcome=el('messages').querySelector('.chat-welcome');if(welcome)welcome.remove();
  el('messages').insertAdjacentHTML('beforeend',`<div class="message-user"><div class="user-bubble">${esc(q)}</div></div>`);
  const loading=document.createElement('div');loading.className='assistant-bubble';loading.innerHTML=`<div class="assistant-name">ProofNotes · thinking</div><div class="typing"><span></span><span></span><span></span></div>`;
  el('messages').appendChild(loading);jumpBottom();setBusy(true);
- try{if(!state.chatId){const made=await api('/api/chats',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({doc_ids:state.scopeDocIds,course_id:state.scopeCourseId})});state.chatId=made.chat.id;}
+ try{await ensureChat();
    const d=await api(`/api/chats/${state.chatId}/ask`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,model:el('model-select').value,response_mode:state.responseMode})});
    const messageId=++state.messageCount;state.sourceMap[messageId]=d.sources||[];loading.outerHTML=answerHtml(d,messageId);
    state.history.push({role:'user',content:q});state.history.push({role:'assistant',content:(d.direct||[]).map(x=>x.text).join(' ')});
@@ -319,6 +355,24 @@ function init(){
  for(const evt of ['dragenter','dragover'])el('dropzone').addEventListener(evt,e=>{e.preventDefault();el('dropzone').classList.add('dragover')});
  for(const evt of ['dragleave','drop'])el('dropzone').addEventListener(evt,e=>{e.preventDefault();el('dropzone').classList.remove('dragover')});
  el('dropzone').addEventListener('drop',e=>uploadFiles([...e.dataTransfer.files]));
+ el('chat-attach').onclick=()=>el('chat-file-input').click();el('chat-file-input').onchange=e=>uploadChatFiles([...e.target.files]);
+ // Drag and drop uses the same validated, auto-indexing chat endpoint as +.
+ document.addEventListener('dragover',e=>{
+  if(!draggedFiles(e)||el('chat').hidden)return;
+  e.preventDefault();
+  if(canDropInChat()){document.querySelector('.main').classList.add('chat-dragover');e.dataTransfer.dropEffect='copy';}
+  else e.dataTransfer.dropEffect='none';
+ });
+ document.addEventListener('dragleave',e=>{if(!e.relatedTarget)document.querySelector('.main').classList.remove('chat-dragover')});
+ document.addEventListener('drop',e=>{
+  if(!draggedFiles(e)||el('chat').hidden)return;
+  e.preventDefault();document.querySelector('.main').classList.remove('chat-dragover');
+  if(canDropInChat())uploadChatFiles([...e.dataTransfer.files]);
+  else if(state.busy)toast('Finish the current request before attaching files.');
+ });
+ el('question').addEventListener('input',resizeComposer);
+ window.addEventListener('resize',resizeComposer);
+
  el('ask-form').onsubmit=e=>{e.preventDefault();ask(el('question').value)};
  el('question').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask(el('question').value)}};
  document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();if(el('chat').hidden)newConversation();else el('question').focus()}if(e.key==='Escape'){hideModal();closeScope();el('source-panel').hidden=true;closeSidebar()}});

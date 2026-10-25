@@ -83,6 +83,49 @@ def definition_answer(question, hits):
     return None
 
 
+
+def explained_from_examples(question, hits):
+    """Use a method signature plus its labeled parameters, not invented definitions.
+
+    The slides may *illustrate* a concept without defining it. Only infer the
+    clearly demonstrated part, and link the actual method example.
+    """
+    if not re.search(r'\bparameters?\b', question, re.I) or not re.search(
+            r'\b(?:what|explain|define|mean|understand)\b', question, re.I):
+        return None
+    for hit in hits:
+        text = hit['text']
+        # A source must actually contain the declaration AND labeled descriptions.
+        signature = re.search(
+            r'\b([A-Za-z_]\w*)\s*\(\s*([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*,\s*'
+            r'([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*\)', text)
+        if not signature or not re.search(r'\bParameters\s*:', text, re.I):
+            continue
+        func, type1, arg1, type2, arg2 = signature.groups()
+        # Don't claim labels if the excerpt lacks them.
+        labels = re.search(
+            r'\bParameters\s*:\s*' + re.escape(arg1) + r'\s*[-–—:]\s*([^\n]+?)\s+'
+            + re.escape(arg2) + r'\s*[-–—:]\s*([^\n]+?)(?:\s+Returns?\s*:|\s+Special\s+Note\s*:|$)',
+            ' '.join(text.split()), re.I)
+        if not labels:
+            # A faithful example is still useful without guessing the label text.
+            if not all(re.search(r'\b' + re.escape(a) + r'\b', text[signature.end():], re.I) for a in (arg1, arg2)):
+                continue
+            explanation = f'In this lecture, parameters are named inputs declared in a method signature. For example, `{func}({type1} {arg1}, {type2} {arg2})` takes `{arg1}` and `{arg2}` as parameters.'
+        else:
+            explanation = (f'Parameters are the named inputs a method accepts. The lecture uses '
+                           f'`{func}({type1} {arg1}, {type2} {arg2})`: `{arg1}` and `{arg2}` are its two parameters.')
+        # The source may include a heading before the method example. Keep a
+        # literal span starting at the signature and ending after 'Parameters'.
+        start = max(0, signature.start() - 50)
+        end = min(len(text), max(signature.end(), text.lower().find('parameters:', signature.end()) + 100))
+        quote = text[start:min(len(text), end)].strip()
+        if len(quote) < 12:
+            continue
+        return _result([{'text': explanation, 'source_ids': ['S1']}],
+                       [_source(hit, 'S1', quote)])
+    return None
+
 def lecture_overview(question, rows, doc_ids=None):
     """Look up the actual uploaded lecture by its file name, not by guessing."""
     match = re.search(r'\blecture\s*(\d+(?:[.\-]\d+)*)\b', question.lower())

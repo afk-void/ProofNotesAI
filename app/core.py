@@ -1,6 +1,16 @@
 """Pure parsing, chunking, lexical helpers, and evidence validation."""
 import re
 import math
+
+# Common Wingdings/Symbol private-use glyphs in lecture PDFs.
+_PDF_GLYPHS = str.maketrans({
+    "\uf097": "•", "\uf0b7": "•", "\uf0a7": "•", "\uf0d8": "•",
+    "\uf09e": "•", "\uf0fc": "✓", "\uf0e0": "→",
+})
+
+def readable_text(value: str) -> str:
+    """Clean PDF font glyphs, without rewriting the indexed meaning."""
+    return value.translate(_PDF_GLYPHS)
 from typing import Optional
 
 
