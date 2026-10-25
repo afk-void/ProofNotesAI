@@ -1,6 +1,8 @@
 .env
 .venv/
 __pycache__/
+*.pyc
+.pytest_cache/
 app/data/
 *.pdf
 *.db
