@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101216">
+  <meta name="description" content="ProofNotes is a private workspace to ask questions, organize courses, and study from your own material.">
+  <title>ProofNotes — Your study workspace</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%232b333b'/%3E%3Cpath d='M18 16h28v32H18z' fill='none' stroke='%23c2e6a4' stroke-width='4'/%3E%3Cpath d='M25 28h14M25 36h10' stroke='%23c2e6a4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main-scroll">Skip to main content</a>
+<div class="shell">
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+    <div class="sidebar-top">
+      <button class="brand" id="brand-home" type="button" aria-label="ProofNotes home">
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 3h12v18H6z"/><path d="M9 9h6M9 13h6M9 17h4"/></svg></span>
+        <span class="brand-text"><strong>proofnotes<span class="brand-stop">.</span></strong></span>
+      </button>
+      <button id="new-chat" class="new-chat" type="button"><span class="new-chat-symbol" aria-hidden="true">+</span> New chat <kbd>⌘ K</kbd></button>
+    </div>
+    <nav class="primary-nav" aria-label="Workspace">
+      
+      <button class="nav-link active" id="home-btn" data-nav="home" type="button"><span class="nav-icon" aria-hidden="true">⌂</span><span>Home</span></button>
+      <button class="nav-link" id="lens-btn" data-nav="lens" type="button" aria-label="Evidence lens conversations"><span class="nav-icon" aria-hidden="true">☷</span><span>Chats</span></button>
+      <button class="nav-link" id="sources-btn" data-nav="sources" type="button"><span class="nav-icon" aria-hidden="true">▤</span><span>Sources</span><span class="nav-count" id="doc-total">0</span></button>
+      <div class="nav-section-label study-label">STUDY TOOLS</div>
+      <button class="nav-link" id="recall-btn" data-nav="recall" aria-label="Recall lab" type="button"><span class="nav-icon" aria-hidden="true">◉</span><span>Recall Lab</span></button>
+      <button class="nav-link" id="gap-btn" data-nav="radar" aria-label="Coverage radar" type="button"><span class="nav-icon" aria-hidden="true">▦</span><span>Coverage Radar</span></button>
+      <button class="nav-link" id="claim-btn" data-nav="claim" aria-label="Claim inspector" type="button"><span class="nav-icon" aria-hidden="true">◇</span><span>Claim Inspector</span></button>
+    </nav>
+    <div class="sidebar-course-area">
+      <div class="sidebar-library-head"><span>COURSES</span><button id="sidebar-add-course" type="button" class="sidebar-small-action" aria-label="Add course" title="Add a course">+</button></div>
+      <div id="sidebar-course-list" class="sidebar-course-list"><div class="no-files">Your courses will appear here.</div></div>
+    </div>
+    <section class="sidebar-chats" aria-label="Recent conversations">
+      <div class="sidebar-library-head"><span>RECENT CHATS</span><span id="chat-total">0</span></div>
+      <div id="chat-list" class="chat-list"><div class="no-files">No conversations yet.</div></div>
+    </section>
+    <div class="sidebar-library" hidden><div class="file-list" id="file-list"></div><button id="add-doc" class="add-source" type="button">Add source</button></div>
+    
+  </aside>
+  <div class="mobile-scrim" id="mobile-scrim" hidden></div>
+  <main class="main">
+    <header class="topbar">
+      <div class="crumb-left"><button class="mobile-menu" id="mobile-menu" aria-label="Open navigation" aria-expanded="false" type="button">☰</button><span class="workspace-crumb"><b id="crumb-current">Home</b></span></div>
+      <div class="header-right"><span class="verify-chip"><span class="status-dot" aria-hidden="true"></span> On-device</span><label class="model-label" for="model-select">Model</label><select aria-label="Local model" id="model-select"><option value="qwen3.6:27b">Qwen 3.6 · 27B</option><option value="qwen3.5:9b">Qwen 3.5 · 9B Fast</option><option value="qwen3.6:35b">Qwen 3.6 · 35B MoE</option><option value="qwen3.5:4b">Qwen 3.5 · 4B</option></select></div>
+    </header>
+    <div class="main-scroll" id="main-scroll" tabindex="-1">
+      <section class="landing" id="landing">
+        <div class="landing-top"><span class="section-kicker">YOUR LIBRARY</span><h1>Study with clarity.</h1><p class="intro">Your courses, conversations, and study material in one place.</p></div>
+        <div class="home-actions"><button class="home-action-primary" id="home-start-chat" type="button">Start a conversation <span aria-hidden="true">↗</span></button><button class="home-action-secondary" id="home-add-notes" type="button">+ Add files</button></div>
+        <div class="readiness" id="readiness" role="status">Checking local models…</div>
+        <div class="home-section-header"><div><h2>Courses</h2><p>Keep every chat and document in the right place.</p></div><button class="quiet-link" type="button" id="home-manage-sources">Manage sources ↗</button></div>
+        <div class="course-grid" id="home-courses"><div class="home-empty">Your courses will appear here once you add them.</div></div>
+        <div class="home-section-header recent-heading"><div><h2>Recent material</h2><p>Pick up where you left off.</p></div><span class="home-library-count" id="home-library-count"></span></div>
+        <div class="recent-docs" id="home-recent-docs"><div class="home-empty">Upload a lecture, syllabus, or notes to get started.</div></div>
+        <div class="home-upload" id="dropzone" role="button" tabindex="0" aria-label="Upload study material"><span class="home-upload-symbol" aria-hidden="true">↑</span><span><strong>Drop files here to add to your library</strong><small>PDF, PowerPoint, Word, images, and text</small></span><button class="upload-btn" id="upload-primary" type="button">Browse files</button></div>
+        <span hidden><b id="stat-docs">0</b><b id="stat-pages">0</b><b id="stat-passages">0</b></span>
+      </section>
+      <section class="mode-section" id="mode-section" hidden><div class="mode-head"><h2 id="mode-title">Study tool</h2><p id="mode-subtitle"></p></div><div id="mode-content"></div><span hidden id="mode-number">02</span></section>
+      <section class="chat" id="chat" hidden><div class="chat-head"><div class="chat-heading-row"><h2 id="chat-title">New conversation</h2><button id="chat-scope" type="button" class="scope-button" aria-label="Choose conversation sources">Entire library ▾</button></div></div><div id="messages" class="messages" role="log" aria-label="Conversation" aria-live="polite" aria-relevant="additions"></div></section>
+    </div>
+    <footer class="composer-wrap" id="composer-wrap" hidden><form id="ask-form" class="composer"><label class="composer-label" for="question">Ask ProofNotes</label><div class="composer-row"><textarea id="question" placeholder="Ask a question…" aria-label="Message ProofNotes" rows="1" required></textarea><button type="submit" class="send" id="ask-send" aria-label="Send message">↑</button></div><div class="composer-bottom"><span id="composer-source-label">· Entire library</span><span class="auto-source-label" title="Automatic · sources when relevant">Uses sources when relevant</span></div></form><span class="composer-tip">Enter to send · Shift + Enter for a new line</span></footer>
+  </main>
+  <aside class="source-panel" id="source-panel" aria-label="Evidence source" hidden><div class="source-header"><div><div class="source-overline">ORIGINAL SOURCE</div><h3 id="source-title">Lecture notes</h3></div><button class="close-source" id="close-source" aria-label="Close source" type="button">×</button></div><div class="source-metadata"><span id="source-page">Page 1</span><span id="source-ocr"></span></div><p class="source-lead">Check the quoted passage in its original context.</p><div class="pdf-preview" id="pdf-preview" hidden><div class="pdf-caption">PAGE PREVIEW</div><img id="pdf-image" alt="Original PDF page with evidence highlighted"></div><div class="transcript-label">EXTRACTED TEXT</div><div id="source-text" class="source-text"></div><div class="source-bottom"><a href="#" id="original-link" target="_blank" rel="noopener noreferrer">Open original file ↗</a></div></aside>
+</div>
+<div class="modal-shade" id="scope-modal" hidden><div class="modal scope-modal" role="dialog" aria-modal="true" aria-labelledby="scope-title"><button class="modal-close" id="close-scope" aria-label="Close source selection" type="button">×</button><div class="modal-index">CHAT SOURCES</div><h2 id="scope-title">Choose your sources</h2><p>Limit this conversation to a course or selected files.</p><label class="field-label" for="scope-type">Source collection</label><select id="scope-type" class="course-picker" aria-label="Choose course or documents"></select><div id="scope-doc-list" class="scope-doc-list"></div><button class="modal-choose" id="save-scope" type="button">Use selected sources ↗</button></div></div>
+<div class="modal-shade" id="upload-modal" hidden><div class="modal" role="dialog" aria-modal="true" aria-labelledby="upload-title"><button class="modal-close" id="close-upload" aria-label="Close upload" type="button">×</button><div class="modal-index">YOUR LIBRARY</div><h2 id="upload-title">Add study material</h2><p>Organize uploads by course so your chats stay focused.</p><label class="field-label" for="upload-course">Course (optional)</label><select id="upload-course" class="course-picker"><option value="">Unassigned</option></select><div class="kind-options"><label><input type="radio" name="kind" value="notes" checked><span><b>Personal notes</b><small>Readings, notes, summaries</small></span></label><label><input type="radio" name="kind" value="slides"><span><b>Lecture slides</b><small>Instructor slides and handouts</small></span></label></div><input type="file" id="file-input" multiple accept=".pdf,.docx,.pptx,.txt,.md,.png,.jpg,.jpeg,.webp" hidden><button class="modal-choose" id="choose-files" type="button">Choose files ↗</button><p class="modal-foot">18 MB max per file. Please review OCR for scanned or handwritten notes.</p></div></div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>
